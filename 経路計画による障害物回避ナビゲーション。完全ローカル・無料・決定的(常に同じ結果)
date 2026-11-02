@@ -1,0 +1,142 @@
+"""A*経路計画による障害物回避ナビゲーション。完全ローカル・無料・決定的(常に同じ結果)。
+
+グリッド 0.25m ごとにコスト付き探索を行い、
+ロボットの速度指令 (v, w) に変換してゴールまで自律走行させる。
+"""
+
+import heapq
+import math
+
+from robot_sim import DT
+
+GRID_STEP = 0.25
+GOAL_RADIUS = 0.45
+MAX_V = 0.5          # 並進速度上限[m/s](安全設計)
+MAX_W = 1.2          # 角速度上限[rad/s]
+
+
+def build_grid(world, margin=0.3):
+    """障害物+壁の周囲にマージンを付けた占有グリッドを作る(True=通行不可)。"""
+    n = int(math.ceil(world.size / GRID_STEP))
+    grid = [[False] * n for _ in range(n)]
+    r = world.robot_radius + margin
+    for gy in range(n):
+        for gx in range(n):
+            x = (gx + 0.5) * GRID_STEP
+            y = (gy + 0.5) * GRID_STEP
+            blocked = (x - r < 0 or y - r < 0 or x + r > world.size or y + r > world.size)
+            if not blocked:
+                for (x0, y0, x1, y1) in world.obstacles:
+                    if (x0 - r) <= x <= (x1 + r) and (y0 - r) <= y <= (y1 + r):
+                        blocked = True
+                        break
+            grid[gy][gx] = blocked
+    return grid
+
+
+def astar(world, start, goal):
+    """A*探索。成功時は経路 [(x,y), ...] を返す。失敗時は None。"""
+    grid = build_grid(world)
+    n = len(grid)
+
+    def to_grid(p):
+        return (int(p[0] / GRID_STEP), int(p[1] / GRID_STEP))
+
+    def passable(gx, gy):
+        return 0 <= gx < n and 0 <= gy < n and not grid[gy][gx]
+
+    def nearest_passable(gx, gy):
+        """開始/ゴールセルが障害物内なら近くの通行可能セルへ退避。"""
+        if passable(gx, gy):
+            return gx, gy
+        best = None
+        for d in range(1, 12):
+            for dx in range(-d, d + 1):
+                for dy in (-d, d):
+                    for (cx, cy) in ((gx + dx, gy + dy), (gx + dx, gy - dy)):
+                        if passable(cx, cy):
+                            dist = dx * dx + dy * dy
+                            if best is None or dist < best[0]:
+                                best = (dist, cx, cy)
+            if best:
+                return best[1], best[2]
+        return gx, gy
+
+    sx, sy = nearest_passable(*to_grid(start))
+    tx, ty = nearest_passable(*to_grid(goal))
+
+    openh = [(0.0, sx, sy)]
+    came = {}
+    g = {(sx, sy): 0.0}
+    while openh:
+        _, cx, cy = heapq.heappop(openh)
+        if (cx, cy) == (tx, ty):
+            path = [(cx, cy)]
+            while path[-1] in came:
+                path.append(came[path[-1]])
+            path.reverse()
+            return [((gx + 0.5) * GRID_STEP, (gy + 0.5) * GRID_STEP)
+                    for (gx, gy) in path]
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1),
+                       (1, 1), (1, -1), (-1, 1), (-1, -1)):
+            nx_, ny_ = cx + dx, cy + dy
+            if not passable(nx_, ny_):
+                continue
+            cost = math.hypot(dx, dy)
+            ng = g[(cx, cy)] + cost
+            if ng < g.get((nx_, ny_), float("inf")):
+                g[(nx_, ny_)] = ng
+                came[(nx_, ny_)] = (cx, cy)
+                h = math.hypot(tx - nx_, ty - ny_)
+                heapq.heappush(openh, (ng + h, nx_, ny_))
+    return None
+
+
+def compute_cmd(robot, path, lookahead=0.6):
+    """経路追従(ピュアパーシュート)。
+
+    経路全体の中で現在位置に最も近い点を追跡基準にし、
+    その先 look_ahead 距離の点を狙って (v, w) を計算する。
+    """
+    gx, gy = path[-1]
+    if math.hypot(gx - robot.x, gy - robot.y) < GOAL_RADIUS:
+        return 0.0, 0.0, True
+    # 1) 現在位置に最も近い経路上の点を探す(追跡の基準)
+    best_i, best_d = 0, float("inf")
+    for i, (px, py) in enumerate(path):
+        d = math.hypot(px - robot.x, py - robot.y)
+        if d < best_d:
+            best_i, best_d = i, d
+    # 2) 基準点から先読み距離だけ進んだ点を狙う
+    target_i = best_i
+    for j in range(best_i, len(path)):
+        px, py = path[j]
+        if math.hypot(px - robot.x, py - robot.y) >= lookahead:
+            target_i = j
+            break
+    else:
+        target_i = len(path) - 1
+    tx, ty = path[target_i]
+    dth = math.atan2(ty - robot.y, tx - robot.x) - robot.th
+    dth = math.atan2(math.sin(dth), math.cos(dth))  # [-pi, pi] に正規化
+    w = max(-MAX_W, min(MAX_W, 2.0 * dth))
+    v = MAX_V if abs(dth) < 0.5 else max(0.08, MAX_V * abs(dth) / 2.0)
+    return v, w, False
+
+
+def follow_path(robot, world, path, max_steps=900):
+    """経路を追従してロボットを動かす(ジェネレータ: 1ステップごとに状態を返す)。
+
+    yield: (ステップ数, 移動したか, ゴールしたか, 衝突したか)
+    """
+    for step in range(1, max_steps + 1):
+        v, w, done = compute_cmd(robot, path)
+        if done:
+            yield step, False, True, False
+            return
+        moved = robot.apply(v, w, DT)
+        if not moved:
+            yield step, False, False, True   # 衝突→緊急停止
+            return
+        yield step, True, False, False
+    yield max_steps, False, False, False      # タイムアウト
