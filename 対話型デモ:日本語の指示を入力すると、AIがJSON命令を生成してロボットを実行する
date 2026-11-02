@@ -1,0 +1,95 @@
+"""対話型デモ:日本語の指示を入力すると、AIがJSON命令を生成してロボットを実行する。
+
+  python3 src/interactive_demo.py
+  (終了は 'quit' または Ctrl+C)
+
+AIの出力は必ずJSON形式に限定され、safety.py の安全レイヤを通過した命令だけが実行される。
+"""
+
+import json
+import math
+import sys
+import os
+
+BASE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, BASE)
+
+from robot_sim import World, Robot, DT, MANUAL_VECS
+from japanese_parser import parse_command, to_json
+from safety import sanitize
+from astar_navigator import astar, compute_cmd
+
+
+def execute(world, robot, js):
+    """安全検証済みのJSON命令をロボットに実行させる。"""
+    san, ok, reason = sanitize(js)
+    print(f"  安全レイヤ: {reason}")
+    if not ok:
+        print("  → 実行せず停止しました。")
+        return
+
+    x0, y0, th0 = robot.x, robot.y, robot.th
+    if san["action"] == "auto_navigate":
+        path = astar(world, (robot.x, robot.y), world.goal)
+        if path is None:
+            print("  → 経路が見つからず停止しました。")
+            return
+        for step, moved, done, collision in __import__("astar_navigator").follow_path(
+                robot, world, path):
+            if done:
+                print(f"  → ゴール到達! {step}ステップ({step * DT:.1f}秒)")
+                return
+            if collision:
+                print(f"  → 衝突検出、{step}ステップで緊急停止。")
+                return
+        print("  → 規定ステップ内にゴール未到達。")
+        return
+
+    v, w = MANUAL_VECS[san["action"]]
+    steps = int(round(san["duration"] / DT))
+    collided = False
+    for i in range(steps):
+        if not robot.apply(v, w):
+            collided = True
+            print(f"  → 衝突検出! {i * DT:.1f}秒で緊急停止。")
+            break
+    moved = math.hypot(robot.x - x0, robot.y - y0)
+    turn = math.degrees(robot.th - th0)
+    print(f"  → 完了: 移動 {moved:.2f}m / 回転 {turn:.0f}度"
+          + ("(衝突あり)" if collided else "(衝突なし)"))
+    print(f"  現在位置: ({robot.x:.2f}, {robot.y:.2f})")
+
+
+def main():
+    world = World()
+    robot = Robot(world)
+    print("=" * 60)
+    print("AIによる自然言語指示型ロボット操作(対話型デモ)")
+    print("例: 「2秒間前進してください」「左に曲がってください」")
+    print("    「停止してください」「障害物を避けてゴールへ向かってください」")
+    print("終了: quit / Ctrl+C(Ctrl+C時は必ずロボットを停止します)")
+    print("=" * 60)
+    try:
+        while True:
+            try:
+                text = input("\n指示を入力> ").strip()
+            except EOFError:
+                break
+            if not text:
+                continue
+            if text.lower() in ("quit", "exit", "q"):
+                break
+            parsed = parse_command(text)
+            js = to_json(parsed)
+            print(f"  AIが生成したJSON: {js}")
+            execute(world, robot, js)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        # Ctrl+Cや終了時も必ずロボットを停止させる
+        robot.apply(0.0, 0.0)
+        print("\nロボットを停止しました。終了します。")
+
+
+if __name__ == "__main__":
+    main()
