@@ -1,0 +1,107 @@
+"""Q学習(強化学習)による障害物回避ナビゲーション。完全ローカル・無料。
+
+状態 = (位置グリッド 0.5mごと, 向き90度ごと)
+行動 = forward / turn_left / turn_right の3種(速度指令 v, w に対応)
+報酬 = ゴール接近の_SHAPE + ゴール到達ボーナス - 衝突ペナルティ - ステップコスト
+"""
+
+import json
+import math
+import os
+
+import numpy as np
+
+from robot_sim import DT
+
+GRID_N = 20        # 10 m を 0.5 m ごとに離散化
+HEADINGS = 4       # 向きを 90 度ごとに離散化
+N_ACTIONS = 3
+ACTION_NAMES = ["forward", "turn_left", "turn_right"]
+ACTION_VECS = [(0.4, 0.0), (0.05, 0.9), (0.05, -0.9)]  # (v[m/s], w[rad/s])
+ALPHA = 0.3        # 学習率
+GAMMA = 0.97       # 割引率
+GOAL_RADIUS = 0.45
+
+Q_TABLE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "q_table.json")
+
+
+def heading_bin(th):
+    """向きを 0/1/2/3 (東/北/西/南) に離散化する。"""
+    return int(math.floor(((th % (2 * math.pi)) + math.pi / 4) / (math.pi / 2))) % 4
+
+
+def state_of(x, y, th):
+    ix = min(GRID_N - 1, max(0, int(x / 0.5)))
+    iy = min(GRID_N - 1, max(0, int(y / 0.5)))
+    return ix, iy, heading_bin(th)
+
+
+def run_episode(world, q, rng, eps=0.0, train=False, random_start=False, max_steps=800):
+    """1エピソードを実行する。
+
+    train=True ならQ更新を行い開始位置をランダム化。
+    random_start=True は評価用(開始位置だけランダム化し、学習はしない)。
+    戻り値: (結果 "goal"/"collision"/"timeout", ステップ数)
+    """
+    if train or random_start:
+        x = float(rng.uniform(0.8, 2.8))
+        y = float(rng.uniform(0.8, 2.8))
+        th = float(rng.choice([0.0, math.pi / 2, math.pi, -math.pi / 2]))
+        th += float(rng.uniform(-0.3, 0.3))
+    else:
+        x, y = world.start
+        th = 0.0
+
+    gx, gy = world.goal
+    prev = math.hypot(gx - x, gy - y)
+
+    for step in range(1, max_steps + 1):
+        ix, iy, ih = state_of(x, y, th)
+        if train and rng.random() < eps:
+            ai = int(rng.integers(N_ACTIONS))
+        else:
+            ai = int(np.argmax(q[ix, iy, ih]))
+
+        v, w = ACTION_VECS[ai]
+        nth = th + w * DT
+        nx = x + v * math.cos(nth) * DT
+        ny = y + v * math.sin(nth) * DT
+
+        if world.collide(nx, ny):
+            r, terminal = -60.0, True
+        else:
+            th, x, y = nth, nx, ny
+            nd = math.hypot(gx - x, gy - y)
+            # ゴール接近報酬(強化) + ステップコスト(緩和)
+            r = 8.0 * (prev - nd) - 0.1
+            prev = nd
+            terminal = nd < GOAL_RADIUS
+            if terminal:
+                r += 150.0                # ゴール到達ボーナス
+
+        if train:
+            nxt = 0.0 if terminal else float(np.max(q[state_of(x, y, th)]))
+            q[ix, iy, ih, ai] += ALPHA * (r + GAMMA * nxt - q[ix, iy, ih, ai])
+
+        if terminal:
+            return ("goal" if r > 0 else "collision"), step
+
+    return "timeout", max_steps
+
+
+def greedy_action(q, x, y, th):
+    """現在状態での貪欲(学習済み)行動名を返す。"""
+    ix, iy, ih = state_of(x, y, th)
+    return ACTION_NAMES[int(np.argmax(q[ix, iy, ih]))]
+
+
+def save_q(q, path=None):
+    path = path or Q_TABLE_PATH
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(q.tolist(), f)
+
+
+def load_q(path=None):
+    path = path or Q_TABLE_PATH
+    with open(path, encoding="utf-8") as f:
+        return np.array(json.load(f))
