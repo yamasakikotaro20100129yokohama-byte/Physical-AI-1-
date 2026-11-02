@@ -1,0 +1,48 @@
+"""Q学習ナビゲーションの訓練スクリプト。
+
+  python3 src/train_navigator.py
+
+実行すると src/q_table.json を作成する。
+貪欲方策がランダム開始位置 10/10 でゴールに到達するまで訓練を繰り返す(最大6チャンク)。
+"""
+
+import numpy as np
+
+from robot_sim import World
+from q_learning import run_episode, save_q
+
+EPISODES_PER_CHUNK = 2500
+MAX_CHUNKS = 10
+
+
+def main():
+    world = World()
+    q = np.zeros((20, 20, 4, 3))
+    rng = np.random.default_rng(42)
+    total = 0
+
+    for chunk in range(1, MAX_CHUNKS + 1):
+        results = []
+        for _ in range(EPISODES_PER_CHUNK):
+            eps = max(0.05, 1.0 - total / 4000.0)
+            results.append(run_episode(world, q, rng, eps=eps, train=True)[0])
+            total += 1
+        rate = results.count("goal") / len(results)
+        print(f"[chunk {chunk}] 累計{total}エピソード / 直近のゴール到達率: {rate:.0%}")
+
+        ok = 0
+        for _ in range(10):
+            res, _ = run_episode(world, q, rng, eps=0.0, train=False, random_start=True)
+            ok += (res == "goal")
+        print(f"[chunk {chunk}] 貪欲方策チェック(ランダム開始10回): {ok}/10 成功")
+
+        if ok == 10:
+            print("貪欲方策が安定したため訓練を終了します。")
+            break
+
+    save_q(q)
+    print("src/q_table.json を保存しました。")
+
+
+if __name__ == "__main__":
+    main()
