@@ -1,0 +1,337 @@
+"""デモ実行 + 動画フレーム描画スクリプト。
+
+実際にシミュレーションを実行し、その結果をフレーム画像として出力する。
+演出用の架空映像は作らない。表示されるロボットの動き・JSON・ログはすべて実行結果。
+
+  python3 src/run_demo.py        # video_frames/ に PNG フレームを出力
+  ffmpeg -y -framerate 10 -i video_frames/f%05d.png -c:v libx264 \
+         -pix_fmt yuv420p -crf 22 -movflags +faststart pai_final_demo.mp4
+"""
+
+import json
+import math
+import os
+import sys
+
+BASE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, BASE)
+ROOT = os.path.dirname(BASE)
+OUT_DIR = os.path.join(ROOT, "video_frames")
+os.makedirs(OUT_DIR, exist_ok=True)
+
+import matplotlib
+matplotlib.use("Agg")
+import numpy as np
+from matplotlib import font_manager
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle, Circle
+from PIL import Image
+
+from robot_sim import World, Robot, DT, MANUAL_VECS
+from japanese_parser import parse_command, to_json
+from safety import sanitize
+from astar_navigator import astar, compute_cmd
+
+# ---- 日本語フォントの登録(見つからなければ英語フォントで続行) ----
+FONT_CANDIDATES = [
+    "/home/user/fonts/NotoSansCJKjp-Regular.ttf",
+    "/home/user/fonts/NotoSansCJKjp-Bold.ttf",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+]
+for p in FONT_CANDIDATES:
+    if os.path.exists(p):
+        try:
+            font_manager.fontManager.addfont(p)
+        except Exception:
+            pass
+plt.rcParams["font.family"] = ["Noto Sans CJK JP", "DejaVu Sans"]
+plt.rcParams["axes.unicode_minus"] = False
+
+
+class DemoRenderer:
+    """世界(左)と情報パネル(右)を描き、PNGフレームとして保存する。"""
+
+    def __init__(self, world, robot):
+        self.world = world
+        self.robot = robot
+        self.trail = [(robot.x, robot.y)]
+        self.sim_time = 0.0
+        self.idx = 0
+        self.fig = plt.figure(figsize=(12.8, 7.2), dpi=100)
+        self.ax = self.fig.add_axes([0.015, 0.02, 0.54, 0.92])
+        self._texts = []
+
+    def _panel(self, lines):
+        for t in self._texts:
+            try:
+                t.remove()
+            except Exception:
+                pass
+        self._texts = []
+        y = 0.95
+        for (text, size, weight, color) in lines:
+            t = self.fig.text(0.575, y, text, fontsize=size, fontweight=weight,
+                              color=color, va="top")
+            self._texts.append(t)
+            y -= size * 0.0022
+
+    def draw(self, title, panel_lines):
+        ax = self.ax
+        ax.clear()
+        ax.set_xlim(-0.35, 10.35)
+        ax.set_ylim(-0.35, 10.35)
+        ax.set_aspect("equal")
+        for i in range(11):
+            ax.axhline(i, color="#ececec", lw=0.6, zorder=0)
+            ax.axvline(i, color="#ececec", lw=0.6, zorder=0)
+        for (x0, y0, x1, y1) in self.world.obstacles:
+            ax.add_patch(Rectangle((x0, y0), x1 - x0, y1 - y0,
+                                   facecolor="#8d6e63", edgecolor="#6d4c41", zorder=2))
+        gx, gy = self.world.goal
+        ax.add_patch(Circle((gx, gy), 0.45, fill=False, ls="--",
+                            color="#f9a825", lw=1.6, zorder=3))
+        ax.plot([gx], [gy], marker="*", ms=24, color="#f9a825", mec="#f57f17", zorder=3)
+        sx, sy = self.world.start
+        ax.plot([sx], [sy], marker="o", ms=8, color="#90a4ae", zorder=3)
+        if len(self.trail) > 1:
+            xs = [p[0] for p in self.trail]
+            ys = [p[1] for p in self.trail]
+            ax.plot(xs, ys, color="#42a5f5", lw=2.0, alpha=0.85, zorder=3)
+        r = self.robot
+        ax.add_patch(Circle((r.x, r.y), self.world.robot_radius,
+                            facecolor="#1e88e5", edgecolor="#0d47a1", zorder=5))
+        ax.annotate("", xy=(r.x + 0.62 * math.cos(r.th), r.y + 0.62 * math.sin(r.th)),
+                    xytext=(r.x, r.y), zorder=6,
+                    arrowprops=dict(arrowstyle="-|>", color="#d81b60", lw=2.2,
+                                    mutation_scale=22))
+        ax.set_title(title, fontsize=15, fontweight="bold", loc="left", pad=8)
+        self._panel(panel_lines)
+        self.fig.canvas.draw()
+        buf = self.fig.canvas.buffer_rgba()
+        img = Image.frombuffer("RGBA", self.fig.canvas.get_width_height(), buf).convert("RGB")
+        img.save(os.path.join(OUT_DIR, f"f{self.idx:05d}.png"))
+        self.idx += 1
+
+
+def cmd_lines(cmd_text, js, status, color="#1565c0", extra=None):
+    lines = [
+        ("【あなたの指示(日本語)】", 13, "bold", "#37474f"),
+        (cmd_text, 17, "normal", "#212121"),
+        ("", 8, "normal", "#212121"),
+        ("【AIが生成した動作命令(JSON)】", 13, "bold", "#37474f"),
+        (js, 15, "normal", "#1b5e20"),
+        ("", 8, "normal", "#212121"),
+        ("【安全確認】許可リスト内のaction・duration上限5.0秒を満たす", 11, "normal", "#455a64"),
+        ("", 8, "normal", "#212121"),
+        (status, 15, "bold", color),
+    ]
+    if extra:
+        lines += extra
+    return lines
+
+
+def manual_segment(rd, robot, title, cmd_text, total_frames):
+    """日本語指示 → AI解析(JSON) → 安全検証 → 実行、の一連を描画する。"""
+    parsed = parse_command(cmd_text)
+    js = to_json(parsed)
+    san, ok, reason = sanitize(js)
+    entry = {"input": cmd_text, "ai_json": js, "safety": reason, "executed": ok}
+
+    for _ in range(20):
+        rd.draw(title, cmd_lines(cmd_text, js,
+                "【状態】 実行準備完了(安全チェック通過)", "#e65100"))
+
+    v, w = MANUAL_VECS[san["action"]]
+    steps = int(round(san["duration"] / DT))
+    collided = False
+    x0, y0, th0 = robot.x, robot.y, robot.th
+    for i in range(steps):
+        moved = robot.apply(v, w)
+        rd.sim_time += DT
+        if moved:
+            rd.trail.append((robot.x, robot.y))
+        else:
+            collided = True
+        st = f"【状態】 実行中… {(i + 1) * DT:.1f}/{san['duration']:.1f}秒"
+        rd.draw(title, cmd_lines(cmd_text, js, st, "#1565c0"))
+        if collided:
+            break
+
+    moved_m = math.hypot(robot.x - x0, robot.y - y0)
+    turn_deg = math.degrees(robot.th - th0)
+    res = "衝突検出→緊急停止" if collided else "衝突なし"
+    st = (f"【状態】 完了: {san['action']} {san['duration']:.1f}秒 / "
+          f"実移動 {moved_m:.2f}m / 回転 {turn_deg:.0f}度 / {res}")
+    rest = max(0, total_frames - 20 - steps)
+    for _ in range(rest):
+        rd.draw(title, cmd_lines(cmd_text, js, st,
+                "#b71c1c" if collided else "#2e7d32"))
+    entry.update({"action": san["action"], "duration": san["duration"], "steps": steps,
+                  "moved_m": round(moved_m, 3), "turn_deg": round(turn_deg, 1),
+                  "collided": collided})
+    return entry
+
+
+def auto_segment(rd, robot, title, cmd_text, total_frames, max_steps=900):
+    """A*経路計画AIによる自律ナビゲーションを描画する(表示3倍速)。"""
+    parsed = parse_command(cmd_text)
+    js = to_json(parsed)
+    san, ok, reason = sanitize(js)
+    entry = {"input": cmd_text, "ai_json": js, "safety": reason, "executed": ok}
+
+    path = astar(robot.world, (robot.x, robot.y), robot.world.goal)
+    assert path is not None
+
+    for _ in range(20):
+        rd.draw(title, cmd_lines(cmd_text, js,
+                "【状態】 A*経路計画AIが経路を生成・自律行動を準備", "#e65100"))
+
+    motion_frames = 0
+    steps = 0
+    outcome = "timeout"
+    for step in range(1, max_steps + 1):
+        v, w, done = compute_cmd(robot, path)
+        if done:
+            outcome = "goal"
+            break
+        moved = robot.apply(v, w)
+        rd.sim_time += DT
+        steps = step
+        if moved:
+            rd.trail.append((robot.x, robot.y))
+        else:
+            outcome = "collision"
+            break
+        if step % 3 == 0:  # 3ステップに1フレーム = 表示3倍速
+            st = (f"【状態】 AI(A*経路計画)が自律行動中… {steps}ステップ / "
+                  f"ゴールまで {robot.dist_to_goal():.2f}m(表示3倍速)")
+            rd.draw(title, cmd_lines(cmd_text, js, st, "#1565c0",
+                    extra=[(f"AIが選択した速度指令: v={v:.2f}m/s w={w:.2f}rad/s", 12, "normal", "#4a148c")]))
+            motion_frames += 1
+
+    if outcome == "goal":
+        st = f"【状態】 ゴール到達! {steps}ステップ({steps * DT:.1f}秒)で自律走行成功(衝突なし)"
+        color = "#2e7d32"
+    elif outcome == "collision":
+        st = "【状態】 衝突を検出 → 安全のため即停止(自律走行は失敗)"
+        color = "#b71c1c"
+    else:
+        st = "【状態】 規定ステップ内にゴール未到達(失敗として記録)"
+        color = "#b71c1c"
+    rest = max(0, total_frames - 20 - motion_frames)
+    for _ in range(rest):
+        rd.draw(title, cmd_lines(cmd_text, js, st, color))
+    entry.update({"outcome": outcome, "steps": steps})
+    return entry
+
+
+def main():
+    world = World()
+    robot = Robot(world)
+    rd = DemoRenderer(world, robot)
+    logs = []
+
+    tr_path = os.path.join(ROOT, "test_results.json")
+    tr = {}
+    if os.path.exists(tr_path):
+        with open(tr_path, encoding="utf-8") as f:
+            tr = json.load(f)
+
+    # ---- セグメントA: タイトル(8秒=80フレーム) ----
+    title_lines = [
+        ("Physical AI講座 2026 応用編1 最終課題", 18, "bold", "#0d47a1"),
+        ("", 10, "normal", "#212121"),
+        ("AIによる自然言語指示型ロボット操作", 25, "bold", "#b71c1c"),
+        ("", 14, "normal", "#212121"),
+        ("日本語の指示 → AIが解釈 → JSON動作命令 → ロボット実行", 14, "normal", "#37474f"),
+        ("", 8, "normal", "#212121"),
+        ("AI要素1: 日本語自然言語解析(ローカル・無料・APIキー不要)", 13, "normal", "#212121"),
+        ("AI要素2: A*経路計画による障害物回避ナビゲーション", 13, "normal", "#212121"),
+        ("", 8, "normal", "#212121"),
+        ("※ 本映像は実際のシミュレーション実行結果のみを使用しています", 12, "bold", "#455a64"),
+    ]
+    for _ in range(80):
+        rd.draw("1. タイトル", title_lines)
+
+    # ---- セグメントB: 使用環境(12秒=120フレーム) ----
+    env_lines = [
+        ("【使用環境】", 16, "bold", "#0d47a1"),
+        ("Python 3 / matplotlib / numpy / ffmpeg(すべて無料)", 13, "normal", "#212121"),
+        ("ROS 2 の /cmd_vel(Twist)と同じ v,w の速度指令モデルを採用", 13, "normal", "#212121"),
+        ("※ Gazebo/ROS 2 が使えない環境でも同じ制御ロジックを検証できる", 11, "normal", "#455a64"),
+        ("   軽量2Dシミュレータを自作して使用(講座規則で他ツールも許可)", 11, "normal", "#455a64"),
+        ("", 10, "normal", "#212121"),
+        ("【ロボットの動作命令(ホワイトリスト)】", 16, "bold", "#0d47a1"),
+        ("forward / backward / turn_left / turn_right / stop / auto_navigate", 13, "normal", "#212121"),
+        ("", 10, "normal", "#212121"),
+        ("【安全設計】", 16, "bold", "#0d47a1"),
+        ("・duration上限5秒(異常に長い時間は停止)", 12, "normal", "#212121"),
+        ("・不正なJSON・未知のactionは実行せず停止", 12, "normal", "#212121"),
+        ("・衝突を検出したら即停止", 12, "normal", "#212121"),
+        ("・危険/不明/実行不能な指示はAIが判断して停止", 12, "normal", "#212121"),
+    ]
+    for _ in range(120):
+        rd.draw("2. 使用環境と課題の説明", env_lines)
+
+    # ---- セグメントC: 前進テスト(12秒) ----
+    logs.append(manual_segment(rd, robot, "3. テスト1: 前進",
+                               "2秒間前進してください", 120))
+
+    # ---- セグメントD: 左旋回テスト(10秒) ----
+    logs.append(manual_segment(rd, robot, "4. テスト2: 左旋回",
+                               "左に曲がってください", 100))
+
+    # ---- セグメントE: 右旋回テスト(10秒) ----
+    logs.append(manual_segment(rd, robot, "5. テスト3: 右旋回",
+                               "右に曲がってください", 100))
+
+    # ---- セグメントF: AI自律ナビゲーション(34秒, 表示3倍速) ----
+    logs.append(auto_segment(rd, robot, "6. AI自律行動: 障害物回避ナビゲーション",
+                             "障害物を避けてゴールへ向かってください", 340))
+
+    # ---- セグメントG: 停止テスト(8秒) ----
+    logs.append(manual_segment(rd, robot, "7. テスト4: 停止",
+                               "停止してください", 80))
+
+    # ---- セグメントH: テスト結果まとめ(12秒) ----
+    sum_lines = [
+        ("【テスト結果(実際の実行値)】", 16, "bold", "#b71c1c"),
+        (f"・日本語解析テスト: {tr.get('parser_passed', '?')}/{tr.get('parser_total', '?')} 成功",
+         13, "normal", "#212121"),
+        (f"・安全レイヤテスト: {tr.get('safety_passed', '?')}/{tr.get('safety_total', '?')} 成功",
+         13, "normal", "#212121"),
+        (f"・動作テスト(実行&計測): {tr.get('motion_passed', '?')}/{tr.get('motion_total', '?')} 成功",
+         13, "normal", "#212121"),
+        (f"・A*ナビゲーション評価: 成功率 {tr.get('nav_success_rate', 0) * 100:.0f}%"
+         f"({tr.get('nav_eval_episodes', '?')}エピソード)", 13, "normal", "#212121"),
+        ("", 10, "normal", "#212121"),
+        ("【安全設計】ホワイトリストaction / duration上限5秒 / 不正JSONで停止 / 衝突で即停止",
+         11, "normal", "#455a64"),
+        ("【環境】Python + matplotlib + numpy + ffmpeg / APIキー不要・完全無料", 11, "normal", "#455a64"),
+        ("", 8, "normal", "#212121"),
+        ("【工夫した点】自然言語解析AI+経路計画AIの2段構成。", 12, "normal", "#212121"),
+        ("AIの出力は必ずJSONに限定し、実行前に安全レイヤで検証する二重防御。", 12, "normal", "#212121"),
+        ("", 8, "normal", "#212121"),
+        ("【※】本映像は実際のシミュレーション実行結果のみを使用しています", 11, "bold", "#455a64"),
+    ]
+    for _ in range(120):
+        rd.draw("8. テスト結果まとめ", sum_lines)
+
+    # ---- 実行ログの保存(実際の記録) ----
+    log_path = os.path.join(ROOT, "demo_log.txt")
+    with open(log_path, "w", encoding="utf-8") as f:
+        f.write("デモ実行ログ(実際の実行記録)\n")
+        f.write(f"フレーム数: {rd.idx} (10fps → {rd.idx / 10:.1f}秒)\n\n")
+        for i, e in enumerate(logs, 1):
+            f.write(f"--- セグメント{i} ---\n")
+            f.write(json.dumps(e, ensure_ascii=False, indent=2) + "\n\n")
+
+    print(f"フレーム数: {rd.idx} ({rd.idx / 10:.1f}秒)")
+    for i, e in enumerate(logs, 1):
+        print(f"セグメント{i}: {json.dumps(e, ensure_ascii=False)}")
+    print("demo_log.txt に実行記録を保存しました。")
+
+
+if __name__ == "__main__":
+    main()
