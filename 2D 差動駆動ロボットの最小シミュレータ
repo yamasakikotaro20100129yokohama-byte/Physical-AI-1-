@@ -1,0 +1,76 @@
+"""2D 差動駆動ロボットの最小シミュレータ。
+
+ROS 2 の /cmd_vel (geometry_msgs/Twist) と同じ考え方で、
+並進速度 v [m/s] と角速度 w [rad/s] を指令としてロボットを動かす。
+Gazebo / ROS 2 が使えない環境でも、同じ制御ロジックを検証できる軽量実装。
+"""
+
+import math
+
+DT = 0.1  # 制御周期 [秒] (100 Hz 相当)
+
+
+class World:
+    """正方形の部屋・矩形の障害物・ゴールを定義する。"""
+
+    def __init__(self, size=10.0):
+        self.size = size
+        # 障害物 (x_min, y_min, x_max, y_max)
+        self.obstacles = [
+            (3.5, 0.0, 4.5, 6.0),
+            (3.5, 7.5, 4.5, 10.0),
+        ]
+        self.goal = (8.6, 6.75)
+        self.start = (1.3, 1.3)
+        self.robot_radius = 0.22
+
+    def collide(self, x, y):
+        """ロボット(半径rの円)が壁・障害物・部屋の外に接触するか判定する。"""
+        r = self.robot_radius
+        if x - r < 0.0 or y - r < 0.0 or x + r > self.size or y + r > self.size:
+            return True
+        for (x0, y0, x1, y1) in self.obstacles:
+            if (x0 - r) <= x <= (x1 + r) and (y0 - r) <= y <= (y1 + r):
+                return True
+        return False
+
+
+class Robot:
+    """差動駆動ロボット。v(並進)と w(回転)の速度指令で動く。"""
+
+    def __init__(self, world):
+        self.world = world
+        self.reset()
+
+    def reset(self, x=None, y=None, th=None):
+        sx, sy = self.world.start
+        self.x = sx if x is None else x
+        self.y = sy if y is None else y
+        self.th = 0.0 if th is None else th
+        self.collided = False
+
+    def apply(self, v, w, dt=DT):
+        """1制御周期だけ速度指令を適用する。衝突時は動かさず collided を立てる。"""
+        nth = self.th + w * dt
+        nx = self.x + v * math.cos(nth) * dt
+        ny = self.y + v * math.sin(nth) * dt
+        if self.world.collide(nx, ny):
+            self.collided = True
+            return False
+        self.th, self.x, self.y = nth, nx, ny
+        return True
+
+    def dist_to_goal(self):
+        gx, gy = self.world.goal
+        return math.hypot(gx - self.x, gy - self.y)
+
+
+# 人間の指示系(自然言語→JSON)で使う速度指令。
+# すべて小さな値に制限しており、ロボットが暴走しないようにしてある。
+MANUAL_VECS = {
+    "forward": (0.5, 0.0),     # 0.5 m/s で前進
+    "backward": (0.4, 0.0),    # 0.4 m/s で後退
+    "turn_left": (0.05, 0.9),  # +0.9 rad/s で左旋回(約103度/2秒)
+    "turn_right": (0.05, -0.9),
+    "stop": (0.0, 0.0),
+}
