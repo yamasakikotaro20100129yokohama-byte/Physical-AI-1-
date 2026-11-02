@@ -1,0 +1,98 @@
+"""日本語の自然言語指示を、ロボット用の JSON 命令に変換する AI モジュール。
+
+- 外部 API 不要・無料・完全ローカルで動作する(課題の「AIを使う」要件を満たす)
+- 出力は JSON のみ。未知の指示・危険な指示は stop を返す(安全設計)
+- 生成された JSON は、実行前に safety.py のサニタイザで再度検証される
+  (AIの出力をそのまま実行しないための二重防御)
+"""
+
+import json
+import re
+
+# 許可された動作(ホワイトリスト)
+ALLOWED_ACTIONS = [
+    "forward", "backward", "turn_left", "turn_right", "stop", "auto_navigate",
+]
+
+MAX_DURATION = 5.0        # 動作時間の上限[秒](安全対策)
+DEFAULT_DURATION = 2.0    # 時間指定がない場合の既定値[秒]
+
+_KANJI_NUM = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
+              "六": 6, "七": 7, "八": 8, "九": 9}
+
+# 「危険」「不明」「実行不能」とAIが判断した場合は停止させる
+_DANGER_WORDS = ["危険", "やめて", "実行不能", "わからない", "禁止"]
+
+# 動作判定パターン(上から優先)。stop / 自律 を先に判定するのが重要。
+_ACTION_PATTERNS = [
+    ("stop", [r"停止", r"止まって", r"止まれ", r"ストップ"]),
+    ("auto_navigate", [r"自律", r"ゴール", r"自動で", r"目的地"]),
+    ("backward", [r"後退", r"バック", r"後ろ", r"さがって", r"下がって"]),
+    ("turn_left", [r"左", r"ひだり"]),
+    ("turn_right", [r"右", r"みぎ"]),
+    ("forward", [r"前進", r"進んで", r"進め", r"すすんで", r"前へ", r"前に", r"まっすぐ"]),
+]
+
+
+def _kanji_to_number(text):
+    """漢数字(一〜十九程度)を数値に変換する。"""
+    m = re.search(r"([一二三四五六七八九十]+)", text)
+    if not m:
+        return None
+    s = m.group(1)
+    if s == "十":
+        return 10.0
+    if "十" in s:
+        a, b = s.split("十", 1)
+        return _KANJI_NUM.get(a, 1) * 10 + (_KANJI_NUM.get(b, 0) if b else 0)
+    if len(s) == 1:
+        v = _KANJI_NUM.get(s)
+        return float(v) if v is not None else None
+    return None
+
+
+def parse_duration(text):
+    """文中から「○秒」の部分を取り出す。数字でも漢数字でも対応。"""
+    m = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*秒", text)
+    if m:
+        return float(m.group(1))
+    if re.search(r"秒", text):
+        k = _kanji_to_number(text)
+        if k is not None:
+            return float(k)
+    return None
+
+
+def parse_command(text):
+    """日本語指示 → JSON命令(dict)。
+
+    実行可否の最終判定は safety.py の sanitize() が行う。
+    """
+    # 「危険」「不明」「実行不能」と判断できる語はすべて停止にする
+    for w in _DANGER_WORDS:
+        if w in text:
+            return {"action": "stop", "duration": 0.0, "note": "danger_request"}
+
+    action = None
+    for a, pats in _ACTION_PATTERNS:
+        if any(re.search(p, text) for p in pats):
+            action = a
+            break
+
+    if action is None:
+        # 未知の指示は実行せず停止する
+        return {"action": "stop", "duration": 0.0, "note": "unknown_command"}
+
+    duration = parse_duration(text)
+    if action == "stop":
+        duration = 0.0
+    elif duration is None:
+        duration = DEFAULT_DURATION
+        return {"action": action, "duration": duration, "note": "default_duration"}
+    return {"action": action, "duration": duration, "note": "ok"}
+
+
+def to_json(cmd):
+    """命令 dict を JSON 文字列にする(ログ表示用)。"""
+    return json.dumps({"action": cmd["action"], "duration": cmd["duration"]},
+                      ensure_ascii=False)
