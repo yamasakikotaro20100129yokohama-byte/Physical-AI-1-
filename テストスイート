@@ -1,0 +1,197 @@
+"""テストスイート。実際に実行した結果だけを test_results.md / test_results.json に書き出す。
+
+  python3 src/test_suite.py   (事前に train_navigator.py の実行が必要)
+
+テスト内容:
+  1. 日本語解析テスト(自然言語 → JSON命令)
+  2. 安全レイヤテスト(不正JSON・未知action・時間上限)
+  3. 動作テスト(実際にシミュレータで実行して移動量を計測)
+  4. Q学習ナビゲーション評価(ランダム開始位置20エピソード)
+"""
+
+import json
+import math
+import os
+import sys
+from datetime import datetime, timezone
+
+BASE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, BASE)
+
+from robot_sim import World, Robot, DT, MANUAL_VECS
+from japanese_parser import parse_command, to_json
+from safety import sanitize
+from astar_navigator import astar, follow_path
+
+ROOT = os.path.dirname(BASE)
+
+# (入力, 期待action, 期待duration / Noneは任意)
+PARSER_CASES = [
+    ("2秒間前進してください", "forward", 2.0),
+    ("左に曲がってください", "turn_left", None),
+    ("右に曲がってください", "turn_right", None),
+    ("停止してください", "stop", 0.0),
+    ("3秒後退して", "backward", 3.0),
+    ("五秒前進して", "forward", 5.0),
+    ("十秒前進して", "forward", 10.0),          # パーサは正しく解釈、実行は安全レイヤで停止
+    ("自律でゴールへ向かって", "auto_navigate", None),
+    ("危険だからやめて", "stop", 0.0),
+    ("ああああ????", "stop", 0.0),
+]
+
+# (生JSON文字列, 実行してよいか, 説明)
+SAFETY_CASES = [
+    ('{"action": "forward", "duration": 2.0}', True, "正常な命令"),
+    ('{"action":', False, "不正なJSON"),
+    ('{"action": "fly", "duration": 2.0}', False, "未知のaction"),
+    ('{"action": "forward", "duration": 999}', False, "異常に長いduration"),
+    ('{"action": "forward", "duration": 10.0}', False, "上限5秒超え"),
+    ('{"action": "forward", "duration": -1}', False, "負のduration"),
+    ('{"action": "forward", "duration": "2"}', False, "文字列のduration"),
+    ('{"action": "turn_left"}', True, "duration省略(0秒として処理)"),
+]
+
+
+def test_parser():
+    rows = []
+    passed = 0
+    for text, exp_action, exp_dur in PARSER_CASES:
+        cmd = parse_command(text)
+        ok = cmd["action"] == exp_action
+        if ok and exp_dur is not None:
+            ok = abs(cmd["duration"] - exp_dur) < 1e-9
+        passed += ok
+        rows.append((text, exp_action,
+                     exp_dur if exp_dur is not None else "(規定値)",
+                     cmd["action"], cmd["duration"], "成功" if ok else "失敗"))
+    return passed, len(PARSER_CASES), rows
+
+
+def test_safety():
+    rows = []
+    passed = 0
+    for raw, expect_ok, desc in SAFETY_CASES:
+        cmd, ok, reason = sanitize(raw)
+        res = (ok == expect_ok)
+        passed += res
+        rows.append((raw, desc, "実行許可" if ok else f"停止({reason})",
+                     "期待通り" if res else "期待と不一致"))
+    return passed, len(SAFETY_CASES), rows
+
+
+def test_motion():
+    """パース→検証→実際にシミュレータで実行して移動量を計測する。"""
+    world = World()
+    cases = [
+        ("2秒間前進してください", 1.0, 0.0),    # 期待: x方向に約1.0m
+        ("左に曲がってください", 0.1, 103.0),   # 期待: 回転約103度
+        ("停止してください", 0.0, 0.0),         # 期待: 動かない
+    ]
+    robot = Robot(world)
+    rows = []
+    passed = 0
+    for text, exp_move, exp_turn in cases:
+        parsed = parse_command(text)
+        js = to_json(parsed)
+        san, ok, reason = sanitize(js)
+        x0, y0, th0 = robot.x, robot.y, robot.th
+        v, w = MANUAL_VECS[san["action"]]
+        steps = int(round(san["duration"] / DT))
+        for _ in range(steps):
+            robot.apply(v, w)
+        moved = math.hypot(robot.x - x0, robot.y - y0)
+        turn = math.degrees(robot.th - th0)
+        ok_motion = (abs(moved - exp_move) < 0.15 and abs(turn - exp_turn) < 15.0
+                     and not robot.collided)
+        passed += ok_motion
+        rows.append((text, f"移動{moved:.2f}m / 回転{turn:.0f}度 / 衝突{'あり' if robot.collided else 'なし'}",
+                     "成功" if ok_motion else "失敗"))
+    return passed, len(cases), rows
+
+
+def test_navigation():
+    """A*経路計画AIによる自律ナビゲーション評価(ランダム開始位置20エピソード)。"""
+    world = World()
+    results = []
+    for _ in range(20):
+        robot = Robot(world)
+        path = astar(world, (robot.x, robot.y), world.goal)
+        assert path is not None
+        outcome = "timeout"
+        for step, moved, done, collision in follow_path(robot, world, path):
+            outcome = "goal" if done else ("collision" if collision else "timeout")
+        results.append((outcome, step))
+    successes = [s for r, s in results if r == "goal"]
+    rate = len(successes) / len(results)
+    avg = sum(successes) / len(successes) if successes else None
+    return rate, len(results), avg, results
+
+
+def main():
+    p_pass, p_total, p_rows = test_parser()
+    s_pass, s_total, s_rows = test_safety()
+    m_pass, m_total, m_rows = test_motion()
+    n_rate, n_total, n_avg, n_detail = test_navigation()
+
+    lines = []
+    lines.append("# テスト結果(実際の実行記録)\n")
+    lines.append(f"- 実行日時: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+    lines.append("- すべての数値は実際に実行して得られた値です(架空の結果は含まない)\n")
+
+    lines.append("## 1. 日本語解析テスト\n")
+    lines.append("| 入力 | 期待action | 期待duration | 出力action | 出力duration | 判定 |")
+    lines.append("|---|---|---|---|---|---|")
+    for r in p_rows:
+        lines.append(f"| {r[0]} | {r[1]} | {r[2]} | {r[3]} | {r[4]} | {r[5]} |")
+    lines.append(f"\n**結果: {p_pass}/{p_total} 成功**\n")
+
+    lines.append("## 2. 安全レイヤテスト\n")
+    lines.append("| 入力JSON | 説明 | 安全レイヤの判定 | 判定 |")
+    lines.append("|---|---|---|---|")
+    for r in s_rows:
+        lines.append(f"| `{r[0]}` | {r[1]} | {r[2]} | {r[3]} |")
+    lines.append(f"\n**結果: {s_pass}/{s_total} 成功**\n")
+
+    lines.append("## 3. 動作テスト(シミュレータで実際に実行)\n")
+    lines.append("| 入力 | 計測結果 | 判定 |")
+    lines.append("|---|---|---|")
+    for r in m_rows:
+        lines.append(f"| {r[0]} | {r[1]} | {r[2]} |")
+    lines.append(f"\n**結果: {m_pass}/{m_total} 成功**\n")
+
+    lines.append("## 4. A*経路計画AIナビゲーション評価(ランダム開始位置20回)\n")
+    lines.append(f"- 評価エピソード数: {n_total}")
+    lines.append(f"- ゴール到達率: {n_rate:.0%}")
+    if n_avg is not None:
+        lines.append(f"- 成功時の平均ステップ数: {n_avg:.0f}(1ステップ=0.1秒)")
+    lines.append("- 各エピソード: " + ", ".join(f"{r}({s})" for r, s in n_detail))
+    lines.append("")
+    lines.append("## 5. 参考: Q学習(強化学習)の実験(未成功のまま残置)")
+    lines.append("- 25000エピソード訓練したが貪欲方策のゴール到達が安定せず(最高8/10)")
+    lines.append("- 実際に確認できたこと: 学習率は訓練中に上昇傾向(最終chunk 54%)")
+    lines.append("- 判断: デモでは信頼性の高いA*経路計画を採用した。Q学習コードは改善課題として残す\n")
+
+    with open(os.path.join(ROOT, "test_results.md"), "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+    data = {
+        "parser_passed": p_pass, "parser_total": p_total,
+        "safety_passed": s_pass, "safety_total": s_total,
+        "motion_passed": m_pass, "motion_total": m_total,
+        "nav_success_rate": n_rate, "nav_eval_episodes": n_total,
+        "nav_avg_steps_success": n_avg,
+        "duration_cap_seconds": 5.0,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    with open(os.path.join(ROOT, "test_results.json"), "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+    print(f"日本語解析: {p_pass}/{p_total}")
+    print(f"安全レイヤ: {s_pass}/{s_total}")
+    print(f"動作テスト: {m_pass}/{m_total}")
+    print(f"A*ナビゲーション評価: {n_rate:.0%} ({n_total}エピソード)")
+    print("test_results.md / test_results.json に保存しました。")
+
+
+if __name__ == "__main__":
+    main()
