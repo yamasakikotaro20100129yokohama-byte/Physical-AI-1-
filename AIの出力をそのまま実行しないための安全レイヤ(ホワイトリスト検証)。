@@ -1,0 +1,45 @@
+"""AIの出力をそのまま実行しないための安全レイヤ(ホワイトリスト検証)。
+
+課題ルール「AIの出力をそのまま実行せず、許可された命令だけを実行する」を実装。
+- 不正なJSON → 停止
+- 未知のaction → 停止
+- 異常に長いduration / 負のduration / 非数値 → 停止
+"""
+
+import json
+
+from japanese_parser import ALLOWED_ACTIONS, MAX_DURATION
+
+
+def stop_command(reason):
+    return {"action": "stop", "duration": 0.0, "ok": False, "reason": reason}
+
+
+def sanitize(raw):
+    """AI(または人間)の出力文字列を検証し、実行してよい命令だけを返す。
+
+    戻り値: (命令dict, 実行可否bool, 理由str)
+    """
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return stop_command("invalid_json"), False, "JSONとして解釈できないため停止"
+
+    if not isinstance(data, dict):
+        return stop_command("not_object"), False, "JSONがオブジェクトではないため停止"
+
+    action = data.get("action")
+    if action not in ALLOWED_ACTIONS:
+        return stop_command("unknown_action"), False, f"未知のaction({action})のため停止"
+
+    duration = data.get("duration", 0.0)
+    if isinstance(duration, bool) or not isinstance(duration, (int, float)):
+        return stop_command("bad_duration"), False, "durationが数値でないため停止"
+    if duration < 0:
+        return stop_command("negative_duration"), False, "durationが負のため停止"
+    if duration > MAX_DURATION:
+        return (stop_command("duration_limit"), False,
+                f"durationが上限{MAX_DURATION}秒を超えたため停止")
+
+    cmd = {"action": action, "duration": float(duration), "ok": True, "reason": "ok"}
+    return cmd, True, "ok"
